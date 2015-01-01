@@ -1,0 +1,71 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define ARRAY_SIZE 4
+
+/*
+* Returns whether the index-th bit is true
+*/
+int is_true(char* array, size_t index)
+{
+  size_t byte_index = floor(((float)index)/8.0f);
+  short int bit_index = 7 - (index % 8);
+  char byte = array[byte_index];
+  return (byte & (1 << bit_index)) >> bit_index;
+}
+
+/*
+* Sieves the index-th bit by setting if to 0
+*/
+void sieve(char* array, size_t index)
+{
+  size_t byte_index = floor(((float)index)/8.0f);
+  short int bit_index = 7 - (index % 8);
+
+  array[byte_index] &= ~(1 << bit_index);
+}
+
+int main(int argc, char** argv)
+{
+  printf("### Sequential Eratosthenes Sieve\n");
+  printf("### Sieving up to %d.\n",ARRAY_SIZE*8-1);
+
+  char* byte_array = calloc(ARRAY_SIZE,sizeof(char));
+
+  // set up the array
+  for(int i = 0; i < ARRAY_SIZE; ++i)
+  {
+    byte_array[i] = ~'\0';
+  }
+  sieve(byte_array,0);
+  sieve(byte_array,1);
+
+  // sequential Erathostenes Sieve
+  for(int i = 2; i < sqrt(ARRAY_SIZE*8); ++i)
+  {
+    if(is_true(byte_array,i))
+    {
+      printf("%d is prime\n",i);
+      for(int j = 0; i*i+j*i < ARRAY_SIZE*8; ++j)
+      {
+	printf("Sieving %d\n",i*i+j*i);
+        sieve(byte_array,i*i+j*i);
+      }
+    }
+  }
+
+  // printing the whole output
+  for(int i = 2; i < ARRAY_SIZE*8; ++i)
+  {
+    if(is_true(byte_array,i))
+    {
+      printf("%d - ",i);
+    }
+  }
+
+  printf("done!\n\n### December 2014 - EPFL - Sidney Bovet\n\n");
+
+  free(byte_array);
+  return 0;
+}

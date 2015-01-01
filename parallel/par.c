@@ -1,0 +1,267 @@
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <errno.h>
+
+/*
+* Returns whether the index-th bit is true
+*/
+int is_true(const char* array, const size_t index)
+{
+  size_t byte_index = floor(((float)index)/8.0f);
+  short int bit_index = 7 - (index % 8);
+  char byte = array[byte_index];
+  return (byte & (1 << bit_index)) >> bit_index;
+}
+
+/*
+* Sieves the index-th bit by setting if to 0
+*/
+void sieve(char* array, const size_t index)
+{
+  size_t byte_index = floor(((float)index)/8.0f);
+  short int bit_index = 7 - (index % 8);
+
+  array[byte_index] &= ~(1 << bit_index);
+}
+
+/*
+* Returns the index-th number of local sequence given slave rank and world size
+* NOTE: ranks begin at 1 (0 is the master)
+*/
+static inline uint32_t index_to_int(
+  const int rank,
+  const int w_size,
+  const size_t index)
+{
+  return 2*rank + 1 + 2*index*(w_size - 1);
+}
+static inline uint32_t int_to_index(
+  const int rank,
+  const int w_size,
+  const size_t integer)
+{
+  return (int)((integer-2*rank-1)/(2*(w_size-1)));
+}
+/*
+* Checks if *integer* is part of *rank*'s local sequence
+*/
+static inline int8_t is_local_to(
+  const int rank,
+  const int w_size,
+  const size_t integer)
+{
+  const float expected = (float)int_to_index(rank,w_size,integer);
+  const float actual = (((float)integer)-2.0f*((float)rank)-1.0f)/
+                             (2.0f*(((float)w_size)-1.0f));
+  //printf("rank=%d, integer=%zu, expected=%f, actual=%f\n",rank,integer,expected,actual);
+  return expected == actual;
+}
+
+int main(int argc, char** argv)
+{
+  // ### arguments checking ###
+  errno = 0;
+  if(argc != 2)
+  {
+    printf("unique parameter expected: <maximum number>\n");
+    return 0;
+  }
+  char* p;
+  const size_t MAX_N = strtoll(argv[1], &p, 10);
+  if(errno != 0 || *p != '\0')
+  {
+    printf("Cannot convert %s to a number.\n",argv[1]);
+    return 1;
+  }
+
+  MPI_Init(NULL,NULL);
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  int world_size;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+  if(rank == 0)
+  { // Master
+
+    // output file
+    FILE* file = fopen("primes.txt","w");
+    if(file==NULL)
+    {
+      printf("Error opening file 'primes.txt'!");
+      return 0;
+    }
+
+    fprintf(file,"2\n3\n"); // those two are ommited by the algorithm...
+
+    printf("Sieving up to %d, output in file 'primes.txt'...",MAX_N);
+
+    uint32_t curr_prime = 3;
+    do
+    {
+      int min_curr_prime = MAX_N;
+      for(int i = 1; i < world_size; ++i)
+      { // receive all candidates and select the min
+        uint32_t received;
+        MPI_Recv(
+          &received,
+          1,
+          MPI_UNSIGNED_LONG,
+          i,
+          MPI_ANY_TAG,
+          MPI_COMM_WORLD,
+          MPI_STATUS_IGNORE
+        );
+        if(min_curr_prime > received)
+          min_curr_prime = received;
+      }
+      curr_prime = min_curr_prime;
+      //bcast the new current prime to sieve
+      MPI_Bcast(&curr_prime,1,MPI_UNSIGNED_LONG,0,MPI_COMM_WORLD);
+      fprintf(file,"%zu\n",curr_prime);
+      //printf("New prime found: %zu\n",curr_prime);
+    } while (curr_prime < sqrt(MAX_N));
+
+    curr_prime = 0; // i.e. end of sieving
+    MPI_Bcast(&curr_prime,1,MPI_UNSIGNED_LONG,0,MPI_COMM_WORLD);
+
+    //gather the rest of primes
+    uint32_t gathered = 0;
+    unsigned int slaves_done = 0;
+    while(slaves_done != world_size-1)
+    {
+      MPI_Recv(&gathered,1,MPI_UNSIGNED_LONG,MPI_ANY_SOURCE,
+                 MPI_ANY_TAG,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+      if(gathered != 0)
+        fprintf(file,"%zu\n",gathered);
+      else
+        slaves_done++;
+    }
+    printf(" done!\n");
+    fclose(file);
+  }
+  else
+  { // Slave
+    /*for(int i = 0; i < 2; ++i)
+    {
+      printf("%d-%d-%d\n",
+	rank,
+	int_to_index(rank,world_size,index_to_int(rank,world_size,i)),
+	index_to_int(rank,world_size,i)
+	);
+    }*/
+    // Computing maximum index and array size
+    const uint32_t max_index = floor((MAX_N-2*rank-1)/(2*(world_size-1)));
+    const size_t ARRAY_SIZE = ceil(((float)max_index)/8.0f);
+
+    // Set up the array
+    char* byte_array = calloc(ARRAY_SIZE,sizeof(char));
+    for(size_t i = 0; i < ARRAY_SIZE; ++i)
+    {
+      byte_array[i] = ~'\0';
+    }
+
+    uint32_t curr_prime = 3;
+    size_t curr_index = 0;
+    while(curr_prime != 0) // while master doesn't tell to stop
+    {
+      //printf("%d:Sieving multiples of %zu\n",rank,curr_prime);
+      // find the first local multiple
+      uint32_t first_local_multiple = curr_prime;
+      while(!is_local_to(rank,world_size,first_local_multiple)
+            && first_local_multiple < sqrt(MAX_N))
+      {
+        first_local_multiple += 2*first_local_multiple;
+      }
+
+      // sieve the multiples
+      if(is_local_to(rank,world_size,first_local_multiple))
+      {
+        //printf("%d:First local multiple is %d\n",rank,first_local_multiple);
+        for(int i = int_to_index(rank,world_size,first_local_multiple);
+            i < max_index;
+            i += curr_prime)
+        {
+          //printf("%d:Sieving %zu\n",rank,index_to_int(rank,world_size,i));
+          sieve(byte_array,i);
+        }
+      }
+
+      //find smallest unsieved
+      uint8_t candidate_found = 0;
+      for(int i = curr_index; i <= max_index; ++i)
+      {
+        if(is_true(byte_array,i))
+        {
+          curr_index = i;
+          uint32_t buffer = index_to_int(rank,world_size,i);
+          MPI_Send(&buffer,1,MPI_UNSIGNED_LONG,0,0,MPI_COMM_WORLD);
+          candidate_found = 1;
+          break;
+        }
+      }
+      if(candidate_found == 0)
+      {
+        uint32_t buffer = MAX_N; //to match the corresponding recv
+        MPI_Send(&buffer,1,MPI_UNSIGNED_LONG,0,0,MPI_COMM_WORLD);
+      }
+
+      //printf("Sending %zu from %d to master\n",curr_prime,rank);
+      MPI_Bcast(&curr_prime,1,MPI_UNSIGNED_LONG,0,MPI_COMM_WORLD);
+    }
+
+    // send the rest of unsieved numbers
+    uint16_t isend_performed = 0;
+    MPI_Request request = MPI_REQUEST_NULL;
+    for(int i = curr_index+1; i <= max_index; ++i)
+    {
+      if(is_true(byte_array,i))
+      {
+        uint32_t buffer = index_to_int(rank,world_size,i);
+        isend_performed++;
+        MPI_Send(&buffer,1,MPI_UNSIGNED_LONG,0,0,MPI_COMM_WORLD);//,&request);
+//        if(isend_performed%(world_size-2)*(world_size-2) == 0) //otherwise memory blows up
+//          MPI_Wait(&request,MPI_STATUS_IGNORE);
+      }
+    }
+    //Make sure all send have been operated
+    MPI_Wait(&request,MPI_STATUS_IGNORE);
+    uint32_t buffer = 0;
+    MPI_Send(&buffer,1,MPI_UNSIGNED_LONG,0,0,MPI_COMM_WORLD);
+
+    free(byte_array);
+  }
+
+  // ### sequential Erathostenes Sieve ###
+/*
+  for(size_t i = 2; i < sqrt(ARRAY_SIZE*8); ++i)
+  {
+    if(is_true(byte_array,i))
+    {
+      //printf("%d is prime\n",i);
+      for(size_t j = 0; i*i+j*i < ARRAY_SIZE*8; ++j)
+      {
+	//printf("Sieving %d\n",i*i+j*i);
+        sieve(byte_array,i*i+j*i);
+      }
+    }
+  }*/
+
+  // ### printing the whole output ###
+  /*
+  for(size_t i = 2; i < ARRAY_SIZE*8; ++i)
+  {
+    if(is_true(byte_array,i))
+    {
+      printf("%d - ",i);
+    }
+  }
+  */
+
+//  printf("done!\n\n### December 2014 - EPFL - Sidney Bovet\n\n");
+
+  MPI_Finalize();
+
+  return 0;
+}
